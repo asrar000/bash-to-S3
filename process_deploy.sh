@@ -1,41 +1,41 @@
 #!/bin/bash
 
 # =============================================================================
-# Processor Deployer Script
-# Deploys specified files and zipped folders to S3 by:
-# 1. Uploading individual files as specified
-# 2. Creating a zip archive of specified folders and files
-# 3. Uploading the zip archive to S3
+# Processor Packaging Script
+# Creates modules.zip from the configured ITEMS_TO_ZIP list and extracts the
+# archive into S3-Upload while preserving file and directory names as-is.
 # =============================================================================
 
 set -euo pipefail
 
 # -----------------------------------------------------------------------------
-# S3 Configuration
-# -----------------------------------------------------------------------------
-S3_BUCKET="${S3_BUCKET:-your-s3-bucket-name}"
-S3_SCRIPTS_DIR="${S3_SCRIPTS_DIR:-your/s3/scripts/dir}"
-S3_PREFIX="${S3_SCRIPTS_DIR}/processor"
-
-# AWS Configuration
-AWS_PROFILE="${AWS_PROFILE:-default}"
-AWS_REGION="${AWS_REGION:-us-east-1}"
-
-# -----------------------------------------------------------------------------
 # Directory Configuration
 # -----------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"   # Two levels up from script
-PROCESSOR_DIR="${ROOT_DIR}/processor"
+ROOT_DIR="${ROOT_DIR:-${SCRIPT_DIR}}"
+DEFAULT_PROCESSOR_DIR="${ROOT_DIR}/processor"
+
+if [[ -n "${PROCESSOR_DIR:-}" ]]; then
+    SOURCE_DIR="${PROCESSOR_DIR}"
+elif [[ -d "${DEFAULT_PROCESSOR_DIR}" ]]; then
+    SOURCE_DIR="${DEFAULT_PROCESSOR_DIR}"
+else
+    SOURCE_DIR="${ROOT_DIR}"
+fi
+
+OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/S3-Upload}"
+ZIP_NAME="${ZIP_NAME:-modules.zip}"
+ZIP_PATH="${OUTPUT_DIR}/${ZIP_NAME}"
 
 # -----------------------------------------------------------------------------
 # Logging Setup
 # -----------------------------------------------------------------------------
 CURRENT_DATE="$(date +%Y-%m-%d)"
 CURRENT_DATETIME="$(date +%Y-%m-%d_%H-%M-%S)"
-LOG_DIR="${ROOT_DIR}/logs/deployer/${CURRENT_DATE}"
+LOG_BASE_DIR="${LOG_BASE_DIR:-${ROOT_DIR}/logs/deployer}"
+LOG_DIR="${LOG_BASE_DIR}/${CURRENT_DATE}"
 mkdir -p "${LOG_DIR}"
-LOG_FILE="${LOG_DIR}/rcron_processor_deployer_${CURRENT_DATETIME}.log"
+LOG_FILE="${LOG_DIR}/rcron_processor_packager_${CURRENT_DATETIME}.log"
 
 log() {
     local level="$1"
@@ -43,34 +43,17 @@ log() {
     local message="$*"
     local timestamp
     timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
-    echo "${timestamp} - processor_deployer - ${level} - ${message}" | tee -a "${LOG_FILE}"
+    echo "${timestamp} - processor_packager - ${level} - ${message}" | tee -a "${LOG_FILE}"
 }
 
-log_info()    { log "INFO"     "$@"; }
-log_warning() { log "WARNING"  "$@"; }
-log_error()   { log "ERROR"    "$@"; }
-log_critical(){ log "CRITICAL" "$@"; }
+log_info()     { log "INFO" "$@"; }
+log_warning()  { log "WARNING" "$@"; }
+log_error()    { log "ERROR" "$@"; }
+log_critical() { log "CRITICAL" "$@"; }
 
 # -----------------------------------------------------------------------------
-# Type 1 — Files to Upload Directly to S3 (no zipping)
+# Items to include in modules.zip
 # -----------------------------------------------------------------------------
-FILES_TO_UPLOAD=(
-    "requirements.txt"
-    "install-requirements.sh"
-    "booking_processor.py"
-    "vrbo_processor.py"
-    "hotelplanner_processor.py"
-    "vio_processor.py"
-    "holibob_processor.py"
-    "general_processor.py"
-    "viator_processor.py"
-)
-
-# -----------------------------------------------------------------------------
-# Type 2 — Items to Bundle into a Zip, then Upload
-# Format: ZIP_NAME and its corresponding ITEMS list
-# -----------------------------------------------------------------------------
-ZIP_NAME="modules.zip"
 ITEMS_TO_ZIP=(
     "booking"
     "vrbo"
@@ -83,71 +66,96 @@ ITEMS_TO_ZIP=(
     "config.py"
 )
 
-# -----------------------------------------------------------------------------
-# Function: Upload a single file to S3
-# -----------------------------------------------------------------------------
-upload_file() {
-    local local_path="$1"
-    local s3_key="$2"
+require_command() {
+    local command_name="$1"
 
-    if [[ ! -f "${local_path}" ]]; then
-        log_error "File not found: ${local_path}"
-        return 1
-    fi
-
-    log_info "Uploading ${local_path} to s3://${S3_BUCKET}/${s3_key}"
-
-    if aws s3 cp "${local_path}" "s3://${S3_BUCKET}/${s3_key}" \
-        --profile "${AWS_PROFILE}" \
-        --region  "${AWS_REGION}"; then
-
-        # Verify the upload succeeded
-        if aws s3api head-object \
-            --bucket "${S3_BUCKET}" \
-            --key    "${s3_key}"    \
-            --profile "${AWS_PROFILE}" \
-            --region  "${AWS_REGION}" > /dev/null 2>&1; then
-            log_info "Successfully uploaded ${s3_key}"
-            return 0
-        else
-            log_error "Upload verification failed for ${s3_key}"
-            return 1
-        fi
-    else
-        log_error "Failed to upload ${local_path}"
-        return 1
+    if ! command -v "${command_name}" > /dev/null 2>&1; then
+        log_critical "Required command not found: ${command_name}"
+        exit 1
     fi
 }
 
-# -----------------------------------------------------------------------------
-# Function: Create a zip archive from specified items
-# -----------------------------------------------------------------------------
-create_zip() {
-    local zip_name="$1"
-    local temp_dir="$2"
-    shift 2
-    local items=("$@")
+validate_items() {
+    local missing_items=0
 
-    local zip_path="${temp_dir}/${zip_name}"
+    if [[ ! -d "${SOURCE_DIR}" ]]; then
+        log_critical "Source directory not found: ${SOURCE_DIR}"
+        return 1
+    fi
 
-    # Build zip: walk directories recursively, add files directly
-    for item in "${items[@]}"; do
-        local item_path="${PROCESSOR_DIR}/${item}"
+    for item in "${ITEMS_TO_ZIP[@]}"; do
+        local item_path="${SOURCE_DIR}/${item}"
 
         if [[ ! -e "${item_path}" ]]; then
-            log_warning "Item not found, skipping: ${item_path}"
-            continue
-        fi
-
-        if [[ -d "${item_path}" ]]; then
-            # Add directory contents, preserving relative path from PROCESSOR_DIR
-            (cd "${PROCESSOR_DIR}" && zip -r "${zip_path}" "${item}" -x "*.pyc" -x "*/__pycache__/*")
-        else
-            # Add individual file, preserving relative path from PROCESSOR_DIR
-            (cd "${PROCESSOR_DIR}" && zip "${zip_path}" "${item}")
+            log_error "Missing item: ${item_path}"
+            missing_items=1
         fi
     done
 
-    log_info "Created zip archive at ${zip_path}"
-    echo "${zip_path}"
+    if [[ "${missing_items}" -ne 0 ]]; then
+        return 1
+    fi
+
+    return 0
 }
+
+create_zip() {
+    mkdir -p "${OUTPUT_DIR}"
+    rm -f "${ZIP_PATH}"
+
+    log_info "Creating ${ZIP_PATH} from ${SOURCE_DIR}"
+
+    for item in "${ITEMS_TO_ZIP[@]}"; do
+        local item_path="${SOURCE_DIR}/${item}"
+
+        if [[ -d "${item_path}" ]]; then
+            # Keep folder names unchanged and skip Python cache files.
+            (
+                cd "${SOURCE_DIR}" &&
+                zip -rq "${ZIP_PATH}" "${item}" -x "*.pyc" -x "*/__pycache__/*"
+            )
+        else
+            # Keep file names unchanged, including extensions like .py.
+            (
+                cd "${SOURCE_DIR}" &&
+                zip -q "${ZIP_PATH}" "${item}"
+            )
+        fi
+    done
+
+    log_info "Created zip archive at ${ZIP_PATH}"
+}
+
+extract_zip() {
+    mkdir -p "${OUTPUT_DIR}"
+
+    log_info "Extracting ${ZIP_PATH} into ${OUTPUT_DIR}"
+    unzip -oq "${ZIP_PATH}" -d "${OUTPUT_DIR}"
+    log_info "Extracted ${ZIP_NAME} into ${OUTPUT_DIR}"
+}
+
+package_items() {
+    require_command "zip"
+    require_command "unzip"
+
+    log_info "Using source directory: ${SOURCE_DIR}"
+    log_info "Using output directory: ${OUTPUT_DIR}"
+
+    if ! validate_items; then
+        log_critical "Packaging stopped because one or more ITEMS_TO_ZIP entries are missing"
+        return 1
+    fi
+
+    create_zip
+    extract_zip
+
+    log_info "Packaging completed successfully"
+    return 0
+}
+
+if ! package_items; then
+    log_critical "Packaging encountered errors. Check log: ${LOG_FILE}"
+    exit 1
+fi
+
+exit 0
